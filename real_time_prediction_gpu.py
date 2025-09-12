@@ -7,16 +7,14 @@ from tkinter import ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import time
+from tkinter import scrolledtext
 from PIL import Image, ImageTk
 import os
-
-# --- New Import for Capstone 2 ---
-from mitre_mapping import mitre_attack_mappings
 
 # --- 1. CONFIGURATION ---
 # Define the path to your WaDi dataset CSV file.
 # IMPORTANT: Ensure this file is in the same directory as this script.
-DATASET_FILE = 'WADI_test_dataset.csv'
+DATASET_FILE = 'WADI_gpu_test_dataset.csv'
 
 # Define the path to your topology image file.
 # IMPORTANT: Ensure this file is in the same directory as this script.
@@ -91,6 +89,10 @@ def load_and_prepare_data(filepath, features, label_col):
     # Calculate statistics for the original unscaled training data
     train_mean = X_train.mean()
     train_std = X_train.std()
+    
+    # Normalize the training data for better model performance
+    scaler = MinMaxScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
     
     # Use the full cleaned dataset for real-time simulation, including anomalies
     simulation_data = df_clean.copy()
@@ -241,13 +243,10 @@ class AnomalyDetectionHMI:
         # Headers for the summary table
         self.summary_headers_frame = tk.Frame(self.summary_frame, bg="#34495e")
         self.summary_headers_frame.pack(fill=tk.X)
-        
-        # --- NEW CODE FOR CAPSTONE 2 ---
-        headers = ["Timestamp", "Status", "Anomaly Score", "Reason", "MITRE Tactic", "MITRE Technique"] + list(self.features)
+        headers = ["Timestamp", "Status", "Anomaly Score", "Reason"] + list(self.features)
         self.tree = ttk.Treeview(self.summary_frame, columns=headers, show='headings')
         for col in headers:
             self.tree.heading(col, text=col)
-            # You may want to adjust column widths here
             self.tree.column(col, width=100)
         self.tree.pack(fill=tk.BOTH, expand=True)
         
@@ -292,17 +291,9 @@ class AnomalyDetectionHMI:
         
         self.pattern_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    # --- UPDATED FUNCTION FOR CAPSTONE 2 ---
-    def update_summary(self, idx, original_values, score, status, reason="N/A", mitre_tactic="N/A", mitre_technique="N/A"):
+    def update_summary(self, idx, original_values, score, status, reason="N/A"):
         tag = 'anomaly' if status == "Anomaly" else 'normal'
-        data_to_insert = [
-            str(idx), 
-            status, 
-            f"{score:.2f}", 
-            reason,
-            mitre_tactic,  # New field
-            mitre_technique # New field
-        ] + [f"{v:.2f}" for v in original_values]
+        data_to_insert = [str(idx), status, f"{score:.2f}", reason] + [f"{v:.2f}" for v in original_values]
         self.tree.insert('', 'end', values=data_to_insert, tags=(tag,))
         self.tree.yview_moveto(1)
 
@@ -347,38 +338,34 @@ class AnomalyDetectionHMI:
             self.master.after_cancel(self.after_id)
             self.after_id = None
     
-    # --- UPDATED FUNCTION FOR CAPSTONE 2 ---
     def predict_anomaly_reason(self, current_data_point):
         """
-        Analyzes an anomalous data point to find the most likely reason and maps it to a MITRE technique.
+        Analyzes an anomalous data point to find the most likely reason.
+        The reason is the feature with the highest deviation from its normal mean.
         """
         deviation_scores = {}
         for feature in self.features:
             current_value = current_data_point[feature]
             normal_mean = self.train_mean.get(feature, 0)
             normal_std = self.train_std.get(feature, 0)
-            
+    
+            # Calculate the absolute deviation in terms of standard deviations (Z-score)
             if normal_std > 0:
                 deviation = abs(current_value - normal_mean) / normal_std
             else:
-                deviation = abs(current_value - normal_mean)
-            
+                deviation = abs(current_value - normal_mean) # Handle features with zero variance
+    
             deviation_scores[feature] = deviation
-        
+    
         if not deviation_scores:
-            return "Unknown", "N/A", "N/A"
-        
+            return "Unknown", None, None
+    
         most_deviated_feature = max(deviation_scores, key=deviation_scores.get)
-        reason_text = f"High deviation in {most_deviated_feature} ({FEATURE_UNITS.get(most_deviated_feature, 'Value')})."
-        
-        # Look up MITRE details using the reason string
-        mitre_details = mitre_attack_mappings.get(reason_text, {
-            "tactic": "N/A",
-            "technique": "N/A",
-            "description": "No MITRE mapping found for this anomaly."
-        })
-        
-        return reason_text, mitre_details["tactic"], mitre_details["technique"]
+        deviation_value = deviation_scores[most_deviated_feature]
+    
+        # Return a descriptive reason
+        reason = f"High deviation in {most_deviated_feature} ({FEATURE_UNITS.get(most_deviated_feature, 'Value')})."
+        return reason, most_deviated_feature, deviation_value
 
     def update_plot(self):
         if not self.is_running:
@@ -398,25 +385,31 @@ class AnomalyDetectionHMI:
         prediction = self.model.predict(X_test_scaled)[0]
         anomaly_score = self.model.decision_function(X_test_scaled)[0]
 
+        # Use a sliding window for plotting
         start_index = max(0, self.current_index - self.WINDOW_SIZE)
         data_to_plot = self.data.iloc[start_index:self.current_index + 1][self.features]
         data_to_plot_scaled = self.scaler.transform(data_to_plot)
 
+        # Plot the data
         x_data = np.arange(start_index, self.current_index + 1)
         for i, feature in enumerate(self.features):
             y_data_scaled = data_to_plot_scaled[:, i]
             self.lines[feature].set_data(x_data, y_data_scaled)
         
         if prediction == -1:
-            anomaly_reason, mitre_tactic, mitre_technique = self.predict_anomaly_reason(current_data_point)
+            # Predict the reason for the anomaly
+            anomaly_reason, _, _ = self.predict_anomaly_reason(current_data_point)
             self.anomaly_data.append(self.current_index)
             self.status_label.config(text=f"WARNING: ANOMALY DETECTED! Reason: {anomaly_reason}", bg="#e74c3c")
             print(f"Anomaly detected at index {self.current_index}. Score: {anomaly_score:.2f}. Reason: {anomaly_reason}")
-            self.update_summary(self.current_index, current_data_point[self.features], anomaly_score, "Anomaly", anomaly_reason, mitre_tactic, mitre_technique)
+            # Pass the reason to the summary table
+            self.update_summary(self.current_index, current_data_point[self.features], anomaly_score, "Anomaly", anomaly_reason)
         else:
             self.status_label.config(text="System Status: Running", bg="#2ecc71")
-            self.update_summary(self.current_index, current_data_point[self.features], anomaly_score, "Normal", "N/A", "N/A", "N/A")
+            # Pass "N/A" for the reason to the summary table
+            self.update_summary(self.current_index, current_data_point[self.features], anomaly_score, "Normal")
         
+        # Update anomaly markers
         for i, feature in enumerate(self.features):
             anomaly_x_all = [idx for idx in self.anomaly_data if start_index <= idx <= self.current_index]
             
@@ -424,6 +417,7 @@ class AnomalyDetectionHMI:
             
             self.anomaly_markers[feature].set_data(anomaly_x_all, y_coords)
         
+        # Set the x-axis limits to match the sliding window
         self.ax.set_xlim(start_index, start_index + self.WINDOW_SIZE)
         self.ax.relim()
         self.ax.autoscale_view()
@@ -440,29 +434,34 @@ class AnomalyDetectionHMI:
         This function is called whenever the image_display_frame changes size.
         """
         if self.topology_image: # Only proceed if an image was successfully loaded
+            # Get the current width and height of the image_display_frame
             frame_width = event.width - 10 # Subtract padding
             frame_height = event.height - 40 # Subtract heading height and padding
 
             if frame_width <= 0 or frame_height <= 0:
-                return
+                return # Avoid division by zero or invalid sizes
 
+            # Calculate new dimensions while maintaining aspect ratio
             original_width, original_height = self.topology_image.size
             aspect_ratio = original_width / original_height
 
             if (frame_width / frame_height) > aspect_ratio:
+                # Frame is wider than image, fit by height
                 new_height = frame_height
                 new_width = int(new_height * aspect_ratio)
             else:
+                # Frame is taller than image, fit by width
                 new_width = frame_width
                 new_height = int(new_width / aspect_ratio)
 
-            if new_width < 50 or new_height < 50:  
-                return  
+            # Ensure image doesn't become too small (optional, adjust as needed)
+            if new_width < 50 or new_height < 50: 
+                 return 
             
             resized_image = self.topology_image.resize((new_width, new_height), Image.LANCZOS)
             self.tk_topology_image = ImageTk.PhotoImage(resized_image)
             self.image_label.config(image=self.tk_topology_image)
-            self.image_label.image = self.tk_topology_image
+            self.image_label.image = self.tk_topology_image # Keep a reference!
 
 
 # --- 5. MAIN SCRIPT EXECUTION ---
